@@ -11,10 +11,11 @@ import torch
 from utils.general import LOGGER, colorstr, cv2
 from utils.loggers.clearml.clearml_utils import ClearmlLogger
 from utils.loggers.wandb.wandb_utils import WandbLogger
+from utils.loggers.mlflow.mlflow_utils import MlflowLogger, MlflowTrackerNotSetError
 from utils.plots import plot_images, plot_labels, plot_results
 from utils.torch_utils import de_parallel
 
-LOGGERS = ("csv", "tb", "wandb", "clearml", "comet")  # *.csv, TensorBoard, Weights & Biases, ClearML
+LOGGERS = ("csv", "tb", "wandb", "clearml", "comet", "mlflow")  # *.csv, TensorBoard, Weights & Biases, ClearML, MLflow
 RANK = int(os.getenv("RANK", -1))
 
 try:
@@ -55,6 +56,12 @@ try:
 except (ImportError, AssertionError):
     comet_ml = None
 
+try:
+    import mlflow
+
+    assert hasattr(mlflow, "__version__")  # verify package import not local dir
+except (ImportError, AssertionError):
+    mlflow = None
 
 def _json_default(value):
     """
@@ -150,6 +157,22 @@ class Loggers:
         else:
             self.comet_logger = None
 
+        # MLflow
+        if mlflow and "mlflow" in self.include:
+            try:
+                self.mlflow = MlflowLogger(self.opt)
+
+                if self.mlflow.run_tracking_url:
+                    prefix = colorstr("MLflow: ")
+                    LOGGER.info(
+                        "%sTracking URL set to %s",
+                        prefix,
+                        self.mlflow.run_tracking_url
+                    )
+            except MlflowTrackerNotSetError as e:
+                self.mlflow = None
+                LOGGER.warning(str(e))
+
     @property
     def remote_dataset(self):
         # Get data_dict if custom dataset artifact link is provided
@@ -183,6 +206,9 @@ class Loggers:
             if self.clearml:
                 for path in paths:
                     self.clearml.log_plot(title=path.stem, plot_path=path)
+            if self.mlflow:
+                for path in paths:
+                    self.mlflow.log_artifact(path, "labels")
 
     def on_train_batch_end(self, model, ni, imgs, targets, paths, vals):
         log_dict = dict(zip(self.keys[:3], vals))
@@ -194,12 +220,14 @@ class Loggers:
                 plot_images(imgs, targets, paths, f)
                 if ni == 0 and self.tb and not self.opt.sync_bn:
                     log_tensorboard_graph(self.tb, model, imgsz=(self.opt.imgsz, self.opt.imgsz))
-            if ni == 10 and (self.wandb or self.clearml):
+            if ni == 10 and (self.wandb or self.clearml or self.mlflow):
                 files = sorted(self.save_dir.glob("train*.jpg"))
                 if self.wandb:
                     self.wandb.log({"Mosaics": [wandb.Image(str(f), caption=f.name) for f in files if f.exists()]})
                 if self.clearml:
                     self.clearml.log_debug_samples(files, title="Mosaics")
+                if self.mlflow:
+                    self.mlflow.log_debug_samples(files, "mosaics")
 
         if self.comet_logger:
             self.comet_logger.on_train_batch_end(log_dict, step=ni)
@@ -229,12 +257,14 @@ class Loggers:
 
     def on_val_end(self, nt, tp, fp, p, r, f1, ap, ap50, ap_class, confusion_matrix):
         # Callback runs on val end
-        if self.wandb or self.clearml:
+        if self.wandb or self.clearml or self.mlflow:
             files = sorted(self.save_dir.glob("val*.jpg"))
         if self.wandb:
             self.wandb.log({"Validation": [wandb.Image(str(f), caption=f.name) for f in files]})
         if self.clearml:
             self.clearml.log_debug_samples(files, title="Validation")
+        if self.mlflow:
+            self.mlflow.log_debug_samples(files, "validation")
 
         if self.comet_logger:
             self.comet_logger.on_val_end(nt, tp, fp, p, r, f1, ap, ap50, ap_class, confusion_matrix)
@@ -278,6 +308,13 @@ class Loggers:
         if self.comet_logger:
             self.comet_logger.on_fit_epoch_end(x, epoch=epoch)
 
+        if self.mlflow:
+            self.mlflow.log_metrics(x, epoch)
+
+            if best_fitness == fi:
+                best_results = dict(zip(self.best_keys[1:], vals[3:7]))
+                self.mlflow.log_metrics(best_results, epoch)
+
     def on_model_save(self, last, epoch, final_epoch, best_fitness, fi):
         # Callback runs on model save event
         if (epoch + 1) % self.opt.save_period == 0 and not final_epoch and self.opt.save_period != -1:
@@ -287,6 +324,13 @@ class Loggers:
                 self.clearml.task.update_output_model(
                     model_path=str(last), model_name="Latest Model", auto_delete_file=False
                 )
+            if self.mlflow:
+                if best_fitness == fi:
+                    best = Path(last.parent / "best.pt")
+                    if best.exists():
+                        self.mlflow.log_artifact(str(best), "models", epoch)
+                else:
+                    self.mlflow.log_artifact(str(last), "models", epoch)
 
         if self.comet_logger:
             self.comet_logger.on_model_save(last, epoch, final_epoch, best_fitness, fi)
@@ -327,6 +371,15 @@ class Loggers:
             final_results = dict(zip(self.keys[3:10], results))
             self.comet_logger.on_train_end(files, self.save_dir, last, best, epoch, final_results)
 
+        if self.mlflow:
+            self.mlflow.log_metrics(dict(zip(self.keys[3:10], results)), epoch)
+            
+            model_path = str(best if best.exists() else last)
+            self.mlflow.log_artifact(model_path, "models")
+
+            for f in files + [f"{self.save_dir}/results.csv"]:
+                self.mlflow.log_artifact(str(f), "results")
+
     def on_params_update(self, params: dict):
         # Update hyperparams or configs of the experiment
         if self.wandb:
@@ -335,6 +388,8 @@ class Loggers:
             self.comet_logger.on_params_update(params)
         if self.clearml:
             self.clearml.task.connect(params)
+        if self.mlflow:
+            self.mlflow.log_params(params)
 
 
 class GenericLogger:
